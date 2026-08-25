@@ -1,49 +1,70 @@
 import json
 import websocket
 
-print("🤖 Connecting to Deriv...")
+print("================================")
+print("🤖 DERIV CONNECTION TEST")
+print("================================")
 
-ws = websocket.create_connection(
-    "wss://api.derivws.com/trading/v1/options/ws/public",
-    timeout=15
-)
+URL = "wss://api.derivws.com/trading/v1/options/ws/public"
 
-print("✅ Connected to Deriv!")
+try:
+    print("Connecting to Deriv...")
 
-request = {
-    "active_symbols": "brief",
-    "req_id": 1
-}
+    ws = websocket.create_connection(
+        URL,
+        timeout=15
+    )
 
-ws.send(json.dumps(request))
+    print("✅ Connected successfully!")
 
-while True:
-    message = json.loads(ws.recv())
+    request = {
+        "active_symbols": "brief",
+        "req_id": 1
+    }
 
-    if message.get("msg_type") == "active_symbols":
-        symbols = message.get("active_symbols", [])
+    print("📡 Asking Deriv for active markets...")
 
-        print("\n📊 VOLATILITY INDICES FOUND:\n")
+    ws.send(json.dumps(request))
 
-        found = 0
+    while True:
+        response = json.loads(ws.recv())
 
-        for symbol in symbols:
-            name = symbol.get("underlying_symbol_name", "")
-            code = symbol.get("underlying_symbol", "")
+        if response.get("error"):
+            print("❌ Deriv returned an error:")
+            print(response["error"])
+            break
 
-            if "Volatility" in name:
-                print(f"• {name}  →  {code}")
-                found += 1
+        if response.get("msg_type") == "active_symbols":
 
-        print(f"\n✅ Total Volatility Indices found: {found}")
+            symbols = response.get("active_symbols", [])
 
-        break
+            print("")
+            print("📊 ACTIVE MARKETS")
+            print("----------------------------")
 
-    if "error" in message:
-        print("❌ Deriv returned an error:")
-        print(message["error"])
-        break
+            volatility_count = 0
 
-ws.close()
+            for symbol in symbols:
 
-print("\n🤖 Test finished.")
+                name = symbol.get("display_name", "")
+                code = symbol.get("symbol", "")
+
+                if "Volatility" in name:
+                    print(f"🟢 {name} → {code}")
+                    volatility_count += 1
+
+            print("----------------------------")
+            print(f"✅ Volatility markets found: {volatility_count}")
+
+            break
+
+    ws.close()
+
+    print("")
+    print("🤖 Test finished successfully!")
+
+except Exception as e:
+
+    print("")
+    print("❌ CONNECTION FAILED")
+    print(str(e))
