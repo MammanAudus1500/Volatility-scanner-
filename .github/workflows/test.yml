@@ -1,20 +1,10 @@
-name: Test Scanner
+- name: Install Python
+  uses: actions/setup-python@v5
+  with:
+    python-version: "3.12"
 
-on:
-  workflow_dispatch:
+- name: Install WebSocket library
+  run: pip install websocket-client
 
-jobs:
-  test:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Get code
-        uses: actions/checkout@v4
-
-      - name: Install Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Run test
-        run: python test_deriv.py
+- name: Run test
+  run: python test_deriv.py
