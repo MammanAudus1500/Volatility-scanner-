@@ -1,4 +1,4 @@
-name: Sixsgames Live Scanner
+ name: Sixsgames Live Scanner
 
 on:
   workflow_dispatch:
@@ -16,9 +16,10 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install libraries
+      - name: Install required libraries
         run: |
-          pip install websocket-client
+          python -m pip install --upgrade pip
+          python -m pip install websocket-client requests
 
       - name: Run Sixsgames Scanner
         env:
