@@ -1,10 +1,10 @@
-name: Test Scanner
+name: Sixsgames Live Scanner
 
 on:
   workflow_dispatch:
 
 jobs:
-  test:
+  scanner:
     runs-on: ubuntu-latest
 
     steps:
@@ -16,8 +16,13 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install WebSocket library
-        run: pip install websocket-client
+      - name: Install libraries
+        run: |
+          pip install websocket-client
 
-      - name: Run test
-        run: python test_deriv.py
+      - name: Run Sixsgames Scanner
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python test_deriv.py
