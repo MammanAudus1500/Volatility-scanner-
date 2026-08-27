@@ -1,92 +1,34 @@
 import json
 import websocket
+from datetime import datetime, timezone, timedelta
 
 print("==============================================")
-print("🤖 SIXSGAMES - FULL MARKET DISCOVERY TEST")
+print("🤖 4H CANDLE SCANNER TEST")
 print("==============================================")
 
 URL = "wss://api.derivws.com/trading/v1/options/ws/public"
 
-# Markets we want the scanner to watch
-WANTED_MARKETS = [
-    # Volatility
-    "Volatility 5",
-    "Volatility 5 (1s)",
-    "Volatility 10",
-    "Volatility 10 (1s)",
-    "Volatility 15",
-    "Volatility 15 (1s)",
-    "Volatility 25",
-    "Volatility 25 (1s)",
-    "Volatility 30",
-    "Volatility 30 (1s)",
-    "Volatility 50",
-    "Volatility 50 (1s)",
-    "Volatility 75",
-    "Volatility 75 (1s)",
-    "Volatility 90",
-    "Volatility 90 (1s)",
-    "Volatility 100",
-    "Volatility 100 (1s)",
-    "Volatility 150",
-    "Volatility 150 (1s)",
-
-    # Jump
-    "Jump 10 Index",
-    "Jump 25 Index",
-    "Jump 50 Index",
-    "Jump 75 Index",
-    "Jump 100 Index",
-
-    # Step
-    "Step Index",
-    "Step Index 200",
-    "Step Index 300",
-    "Step Index 400",
-    "Step Index 500",
-
-    # Forex
-    "EUR/USD",
-    "GBP/USD",
-    "USD/JPY",
-    "GBP/JPY",
-    "USD/CAD",
-    "EUR/CAD",
-    "AUD/USD",
-    "AUD/CAD",
-    "NZD/JPY",
-    "AUD/NZD",
-    "EUR/GBP",
-    "NZD/CHF",
-    "CAD/CHF",
-    "EUR/CHF",
-    "CHF/JPY",
-    "GBP/CHF",
-    "NZD/CAD",
-    "GBP/NZD",
-    "CAD/JPY",
-    "AUD/CHF",
-    "GBP/AUD",
-    "USD/CHF",
-
-    # Other
-    "Gold/USD",
-    "BTC/USD",
-    "US 100"
+# We will test these first.
+# Once candle retrieval works, we'll load the complete 46-market list.
+TEST_MARKETS = [
+    "R_10",
+    "R_25",
+    "R_50",
+    "R_75",
+    "R_100",
 ]
 
 
-def clean_name(name):
-    """Make names easier to compare."""
-    return (
-        name.lower()
-        .replace("/", "")
-        .replace("-", "")
-        .replace("_", "")
-        .replace(" ", "")
-        .replace("index", "")
-        .replace("usd", "usd")
+def nigeria_time(unix_time):
+    """Convert Deriv Unix time to Nigeria time (WAT = UTC+1)."""
+    utc_time = datetime.fromtimestamp(
+        unix_time,
+        timezone.utc
     )
+
+    wat = utc_time + timedelta(hours=1)
+
+    return wat.strftime("%Y-%m-%d %H:%M:%S")
 
 
 try:
@@ -99,140 +41,79 @@ try:
         timeout=20
     )
 
-    print("✅ Connected successfully!")
+    print("✅ Connected!")
 
-    request = {
-        "active_symbols": "brief",
-        "req_id": 1
-    }
+    for symbol in TEST_MARKETS:
 
-    print("📡 Downloading ALL active markets...")
+        print("")
+        print("----------------------------------------------")
+        print(f"📊 REQUESTING 4H CANDLES: {symbol}")
+        print("----------------------------------------------")
 
-    ws.send(json.dumps(request))
+        request = {
+            "ticks_history": symbol,
+            "style": "candles",
+            "granularity": 14400,
+            "count": 10,
+            "end": "latest",
+            "req_id": 100
+        }
 
-    while True:
+        ws.send(json.dumps(request))
 
-        response = json.loads(ws.recv())
+        while True:
 
-        if response.get("error"):
+            response = json.loads(ws.recv())
 
-            print("")
-            print("❌ DERIV ERROR")
-            print(response["error"])
-            break
+            if response.get("error"):
 
-        if response.get("msg_type") == "active_symbols":
+                print("❌ Deriv error:")
+                print(response["error"])
+                break
 
-            symbols = response.get("active_symbols", [])
+            if response.get("msg_type") == "candles":
 
-            print("")
-            print(f"📊 Deriv returned {len(symbols)} active markets")
+                candles = response.get("candles", [])
 
-            # Build searchable market database
-            available = {}
-
-            for market in symbols:
-
-                name = market.get(
-                    "underlying_symbol_name",
-                    ""
+                print(
+                    f"✅ Received {len(candles)} "
+                    f"completed/available 4H candles"
                 )
 
-                code = market.get(
-                    "underlying_symbol",
-                    ""
-                )
+                if candles:
 
-                if name and code:
+                    print("")
+                    print("LATEST CANDLES")
+                    print("----------------------------------------------")
 
-                    available[clean_name(name)] = {
-                        "name": name,
-                        "code": code
-                    }
+                    for candle in candles[-5:]:
 
-            print("")
-            print("==============================================")
-            print("🎯 OUR REQUESTED MARKETS")
-            print("==============================================")
+                        candle_time = nigeria_time(
+                            candle["epoch"]
+                        )
 
-            found = []
-            missing = []
+                        print(
+                            f"{candle_time} WAT | "
+                            f"O={candle['open']} | "
+                            f"H={candle['high']} | "
+                            f"L={candle['low']} | "
+                            f"C={candle['close']}"
+                        )
 
-            for wanted in WANTED_MARKETS:
+                break
 
-                wanted_clean = clean_name(wanted)
-
-                match = None
-
-                # Exact normalized match
-                if wanted_clean in available:
-                    match = available[wanted_clean]
-
-                # Partial matching
-                if match is None:
-
-                    for key, item in available.items():
-
-                        if (
-                            wanted_clean in key
-                            or key in wanted_clean
-                        ):
-                            match = item
-                            break
-
-                if match:
-
-                    found.append(match)
-
-                    print(
-                        f"🟢 {wanted} "
-                        f"→ {match['name']} "
-                        f"→ {match['code']}"
-                    )
-
-                else:
-
-                    missing.append(wanted)
-
-                    print(
-                        f"🔴 NOT FOUND → {wanted}"
-                    )
-
-            print("")
-            print("==============================================")
-            print("📊 DISCOVERY SUMMARY")
-            print("==============================================")
-
-            print(
-                f"🟢 Requested markets found: "
-                f"{len(found)}"
-            )
-
-            print(
-                f"🔴 Requested markets missing: "
-                f"{len(missing)}"
-            )
-
-            if missing:
-
-                print("")
-                print("⚠️ MARKETS NOT FOUND:")
-                print("----------------------------------------------")
-
-                for item in missing:
-                    print(f"   {item}")
-
-            print("")
-            print("==============================================")
-            print("🤖 MARKET DISCOVERY FINISHED")
-            print("==============================================")
-
-            break
+        # Small separator before next market
+        print("")
 
     ws.close()
+
+    print("==============================================")
+    print("✅ 4H CANDLE TEST FINISHED")
+    print("==============================================")
+
 
 except Exception as e:
 
     print("")
-    print("❌ CONNECTION FAILED")
+    print("❌ SCANNER ERROR")
     print(str(e))
