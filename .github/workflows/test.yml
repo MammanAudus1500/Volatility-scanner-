@@ -1,4 +1,4 @@
- name: Sixsgames Live Scanner
+name: Sixsgames Live Scanner
 
 on:
   workflow_dispatch:
