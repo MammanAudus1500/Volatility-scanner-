@@ -212,13 +212,13 @@ def get_4h_candles(ws, symbol):
     """
 
     send_request(ws, {
-        "ticks_history": symbol,
-        "count": CANDLE_COUNT,
-        "end": "latest",
-        "style": "candles",
-        "granularity": 14400,
-        "subscribe": 0,
-        "req_id": 200
+    "ticks_history": symbol,
+    "count": CANDLE_COUNT,
+    "end": "latest",
+    "style": "candles",
+    "granularity": 14400,
+    "req_id": 200
+})
     })
 
     while True:
