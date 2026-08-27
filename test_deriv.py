@@ -1,636 +1,655 @@
 import json
 import websocket
-import time
 from datetime import datetime, timezone, timedelta
 
 # ============================================================
-# SIXSGAMES - TIME BASED 4H STRATEGY SCANNER
+# SIXSGAMES - 4H TIME-BASED STRATEGY SCANNER
 # ============================================================
 #
-# Strategy:
+# STRATEGY
+#
+# SETUP 1:
+# 02:00 candle = reference candle
+# 06:00 candle = confirmation candle
+# 10:00 candle = ENTRY TIME
 #
 # BULLISH:
-# Reference candle: 02:00 WAT
-# Confirmation candle: 06:00 WAT
-# Entry window: 10:00 WAT
-#
-# Conditions:
-# 1. 06:00 candle LOW must go BELOW 02:00 candle LOW
-# 2. 06:00 candle CLOSE must be ABOVE 02:00 candle OPEN
-# 3. If close == 02:00 open -> NO SIGNAL
+# - 02:00 candle must be bullish
+# - 06:00 candle must sweep the LOW of the 02:00 candle
+# - 06:00 candle must CLOSE ABOVE the 02:00 OPEN
+# - Close exactly at the 02:00 open = NO SIGNAL
 #
 # BEARISH:
-# Reference candle: 02:00 WAT
-# Confirmation candle: 06:00 WAT
-# Entry window: 10:00 WAT
+# - 02:00 candle must be bearish
+# - 06:00 candle must sweep the HIGH of the 02:00 candle
+# - 06:00 candle must CLOSE BELOW the 02:00 OPEN
+# - Close exactly at the 02:00 open = NO SIGNAL
 #
-# Conditions:
-# 1. 06:00 candle HIGH must go ABOVE 02:00 candle HIGH
-# 2. 06:00 candle CLOSE must be BELOW 02:00 candle OPEN
-# 3. If close == 02:00 open -> NO SIGNAL
+# SETUP 2:
+# 06:00 candle = reference candle
+# 10:00 candle = confirmation candle
+# 14:00 candle = ENTRY TIME
 #
-# SECOND SETUP:
-#
-# Reference candle: 06:00 WAT
-# Confirmation candle: 10:00 WAT
-# Entry window: 14:00 WAT
-#
-# Same bullish/bearish rules.
-#
-# IMPORTANT:
-# This is a SIGNAL SCANNER only.
-# It does NOT place trades.
+# Same bullish/bearish rules, reversed in time.
 # ============================================================
 
+DERIV_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
 
-URL = "wss://api.derivws.com/trading/v1/options/ws/public"
-
-# WAT = UTC + 1
+# Nigeria / West Africa Time = UTC + 1
 WAT = timezone(timedelta(hours=1))
 
-# How many completed 4H candles to request
-CANDLE_COUNT = 50
+# Requested markets.
+# The scanner will only use symbols that Deriv actually returns.
+REQUESTED_MARKETS = [
+    "1HZ10V",
+    "1HZ15V",
+    "1HZ25V",
+    "1HZ30V",
+    "1HZ50V",
+    "1HZ75V",
+    "1HZ90V",
+    "1HZ100V",
+
+    "R_10",
+    "R_25",
+    "R_50",
+    "R_75",
+    "R_100",
+
+    "JD10",
+    "JD25",
+    "JD50",
+    "JD75",
+    "JD100",
+
+    "stpRNG",
+    "stpRNG2",
+    "stpRNG3",
+    "stpRNG4",
+    "stpRNG5",
+
+    "frxEURUSD",
+    "frxGBPUSD",
+    "frxUSDJPY",
+    "frxGBPJPY",
+    "frxUSDCAD",
+    "frxEURCAD",
+    "frxAUDUSD",
+    "frxAUDCAD",
+    "frxNZDJPY",
+    "frxAUDNZD",
+    "frxEURGBP",
+    "frxNZDCHF",
+    "frxCADCHF",
+    "frxEURCHF",
+    "frxCHFJPY",
+    "frxGBPCHF",
+    "frxNZDCAD",
+    "frxGBPNZD",
+    "frxCADJPY",
+    "frxAUDCHF",
+    "frxGBPAUD",
+    "frxUSDCHF",
+    "frxXAUUSD",
+
+    "cryBTCUSD",
+
+    "OTC_S100"
+]
 
 
-def send_request(ws, request):
-    """Send JSON request to Deriv."""
-    ws.send(json.dumps(request))
+# ------------------------------------------------------------
+# CONNECTION
+# ------------------------------------------------------------
 
+def connect():
+    print("🔌 Connecting to Deriv...")
 
-def receive_response(ws, timeout=20):
-    """Receive one valid JSON response."""
-    ws.settimeout(timeout)
-
-    while True:
-        message = ws.recv()
-
-        if not message:
-            continue
-
-        response = json.loads(message)
-
-        if response.get("error"):
-            raise Exception(str(response["error"]))
-
-        return response
-
-
-def get_active_markets(ws):
-    """
-    Discover active Deriv markets.
-
-    Uses the current active_symbols response format:
-    underlying_symbol
-    underlying_symbol_name
-    """
-
-    print("\n🔎 Discovering Deriv markets...")
-
-    send_request(ws, {
-        "active_symbols": "brief",
-        "req_id": 100
-    })
-
-    while True:
-        response = receive_response(ws)
-
-        if response.get("msg_type") == "active_symbols":
-
-            markets = response.get("active_symbols", [])
-
-            print(f"✅ Deriv returned {len(markets)} active markets")
-
-            return markets
-
-
-def normalize_name(name):
-    """Make market names easier to compare."""
-
-    return (
-        name.upper()
-        .replace("/", "")
-        .replace("-", "")
-        .replace("_", "")
-        .replace(" ", "")
-        .replace("(", "")
-        .replace(")", "")
+    ws = websocket.create_connection(
+        DERIV_URL,
+        timeout=20
     )
 
+    print("✅ Connected successfully!")
 
-def choose_markets(all_markets):
-    """
-    Select the markets we want to scan.
-
-    We use the market names returned by Deriv rather than
-    inventing symbol codes.
-    """
-
-    wanted = [
-        "VOLATILITY5",
-        "VOLATILITY10",
-        "VOLATILITY15",
-        "VOLATILITY25",
-        "VOLATILITY30",
-        "VOLATILITY50",
-        "VOLATILITY75",
-        "VOLATILITY90",
-        "VOLATILITY100",
-        "VOLATILITY150",
-
-        "JUMP10INDEX",
-        "JUMP25INDEX",
-        "JUMP50INDEX",
-        "JUMP75INDEX",
-        "JUMP100INDEX",
-
-        "STEPINDEX",
-        "STEPINDEX200",
-        "STEPINDEX300",
-        "STEPINDEX400",
-        "STEPINDEX500",
-
-        "EURUSD",
-        "GBPUSD",
-        "USDJPY",
-        "GBPJPY",
-        "USDCAD",
-        "EURCAD",
-        "AUDUSD",
-        "AUDCAD",
-        "NZDJPY",
-        "AUDNZD",
-        "EURGBP",
-        "NZDCHF",
-        "CADCHF",
-        "EURCHF",
-        "CHFJPY",
-        "GBPCHF",
-        "NZDCAD",
-        "GBPNZD",
-        "CADJPY",
-        "AUDCHF",
-        "GBPAUD",
-        "USDCHF",
-
-        "XAUUSD",
-        "BTCUSD",
-        "US100"
-    ]
-
-    selected = []
-
-    for market in all_markets:
-
-        name = market.get(
-            "underlying_symbol_name",
-            market.get("display_name", "")
-        )
-
-        symbol = market.get(
-            "underlying_symbol",
-            market.get("symbol", "")
-        )
-
-        normalized = normalize_name(name)
-
-        if normalized in wanted:
-
-            selected.append({
-                "name": name,
-                "symbol": symbol
-            })
-
-    return selected
+    return ws
 
 
-def get_4h_candles(ws, symbol):
-    """
-    Request completed 4-hour candles.
+# ------------------------------------------------------------
+# SEND REQUEST / RECEIVE RESPONSE
+# ------------------------------------------------------------
 
-    Granularity:
-    14400 seconds = 4 hours
-    """
-
-    send_request(ws, {
-    "ticks_history": symbol,
-    "count": CANDLE_COUNT,
-    "end": "latest",
-    "style": "candles",
-    "granularity": 14400,
-    "req_id": 200
-})
-    })
+def send_request(ws, request):
+    ws.send(json.dumps(request))
 
     while True:
+        raw = ws.recv()
 
-        response = receive_response(ws)
+        if not raw:
+            continue
 
-        if response.get("msg_type") == "candles":
+        response = json.loads(raw)
 
-            candles = response.get("candles", [])
+        if response.get("error"):
+            return response
 
-            return candles
+        if (
+            response.get("msg_type")
+            or "candles" in response
+            or "history" in response
+            or "active_symbols" in response
+        ):
+            return response
 
 
-def candle_wat_time(candle):
-    """Convert candle epoch to WAT datetime."""
+# ------------------------------------------------------------
+# GET ACTIVE SYMBOLS FROM DERIV
+# ------------------------------------------------------------
+
+def discover_markets(ws):
+
+    print("")
+    print("=" * 60)
+    print("🔎 DISCOVERING DERIV MARKETS")
+    print("=" * 60)
+
+    request = {
+        "active_symbols": "brief",
+        "product_type": "basic",
+        "req_id": 100
+    }
+
+    response = send_request(ws, request)
+
+    if response.get("error"):
+        print("❌ Market discovery error:")
+        print(response["error"])
+        return {}
+
+    active_symbols = response.get("active_symbols", [])
+
+    available = {}
+
+    for item in active_symbols:
+        symbol = item.get("symbol")
+
+        if symbol:
+            available[symbol] = item
+
+    print(f"📊 Deriv returned {len(available)} active symbols.")
+
+    # Match requested markets with actual Deriv symbols
+    found = {}
+
+    for requested in REQUESTED_MARKETS:
+
+        if requested in available:
+            found[requested] = available[requested]
+
+    print(f"✅ Requested markets available: {len(found)}")
+
+    if found:
+        print("")
+        print("MARKETS TO SCAN")
+        print("-" * 60)
+
+        for symbol, info in found.items():
+            display = info.get("display_name", symbol)
+            print(f"🟢 {display} → {symbol}")
+
+    missing = [
+        symbol for symbol in REQUESTED_MARKETS
+        if symbol not in found
+    ]
+
+    if missing:
+        print("")
+        print("⚠️ NOT AVAILABLE ON THIS DERIV ACCOUNT/API")
+        print("-" * 60)
+
+        for symbol in missing:
+            print(f"🔴 {symbol}")
+
+    return found
+
+
+# ------------------------------------------------------------
+# GET 4H CANDLES
+# ------------------------------------------------------------
+
+def get_candles(ws, symbol, count=80):
+
+    request = {
+        "ticks_history": symbol,
+        "adjust_start_time": 1,
+        "count": count,
+        "end": "latest",
+        "granularity": 14400,
+        "style": "candles",
+        "req_id": 200
+    }
+
+    response = send_request(ws, request)
+
+    if response.get("error"):
+        return None, response["error"]
+
+    candles = response.get("candles", [])
+
+    if not candles:
+        return None, {
+            "message": "No candles returned"
+        }
+
+    return candles, None
+
+
+# ------------------------------------------------------------
+# CONVERT DERIV CANDLE
+# ------------------------------------------------------------
+
+def convert_candle(candle):
 
     epoch = int(candle["epoch"])
 
-    return datetime.fromtimestamp(
+    dt = datetime.fromtimestamp(
         epoch,
         timezone.utc
     ).astimezone(WAT)
 
+    return {
+        "epoch": epoch,
+        "time": dt,
+        "open": float(candle["open"]),
+        "high": float(candle["high"]),
+        "low": float(candle["low"]),
+        "close": float(candle["close"])
+    }
 
-def find_candle(candles, hour):
-    """
-    Find a completed 4H candle beginning at the requested
-    WAT hour.
-    """
+
+# ------------------------------------------------------------
+# FIND CANDLE BY WAT HOUR
+# ------------------------------------------------------------
+
+def find_candle(candles, date_value, hour):
 
     for candle in candles:
 
-        dt = candle_wat_time(candle)
-
-        if dt.hour == hour and dt.minute == 0:
-
+        if (
+            candle["time"].date() == date_value
+            and candle["time"].hour == hour
+        ):
             return candle
 
     return None
 
 
+# ------------------------------------------------------------
+# CHECK BULLISH SETUP
+# ------------------------------------------------------------
+
 def bullish_setup(reference, confirmation):
-    """
-    Bullish rules:
 
-    Confirmation LOW < reference LOW
-    Confirmation CLOSE > reference OPEN
+    # Reference candle must be bullish
+    if reference["close"] <= reference["open"]:
+        return False
 
-    Strict comparisons are intentional.
-    """
+    # Confirmation candle must sweep reference LOW
+    if confirmation["low"] >= reference["low"]:
+        return False
 
-    reference_low = float(reference["low"])
-    reference_open = float(reference["open"])
+    # Confirmation must close STRICTLY above reference OPEN
+    if confirmation["close"] <= reference["open"]:
+        return False
 
-    confirmation_low = float(confirmation["low"])
-    confirmation_close = float(confirmation["close"])
+    return True
 
-    swept_low = confirmation_low < reference_low
-    closed_above_open = confirmation_close > reference_open
 
-    return swept_low and closed_above_open
-
+# ------------------------------------------------------------
+# CHECK BEARISH SETUP
+# ------------------------------------------------------------
 
 def bearish_setup(reference, confirmation):
-    """
-    Bearish rules:
 
-    Confirmation HIGH > reference HIGH
-    Confirmation CLOSE < reference OPEN
+    # Reference candle must be bearish
+    if reference["close"] >= reference["open"]:
+        return False
 
-    Strict comparisons are intentional.
-    """
+    # Confirmation candle must sweep reference HIGH
+    if confirmation["high"] <= reference["high"]:
+        return False
 
-    reference_high = float(reference["high"])
-    reference_open = float(reference["open"])
+    # Confirmation must close STRICTLY below reference OPEN
+    if confirmation["close"] >= reference["open"]:
+        return False
 
-    confirmation_high = float(confirmation["high"])
-    confirmation_close = float(confirmation["close"])
-
-    swept_high = confirmation_high > reference_high
-    closed_below_open = confirmation_close < reference_open
-
-    return swept_high and closed_below_open
+    return True
 
 
-def analyze_setup(candles, reference_hour, confirmation_hour, entry_hour):
-    """
-    Analyze one 4H time-based setup.
-    """
+# ------------------------------------------------------------
+# SCAN ONE DAY
+# ------------------------------------------------------------
 
-    reference = find_candle(candles, reference_hour)
-    confirmation = find_candle(candles, confirmation_hour)
+def scan_day(candles, date_value):
 
-    if reference is None or confirmation is None:
-        return None
+    signals = []
 
-    # Make sure the confirmation candle is later than
-    # the reference candle.
-    reference_time = candle_wat_time(reference)
-    confirmation_time = candle_wat_time(confirmation)
+    # ========================================================
+    # SETUP 1
+    # 02:00 -> 06:00 -> ENTRY 10:00
+    # ========================================================
 
-    if confirmation_time <= reference_time:
-        return None
+    candle_02 = find_candle(
+        candles,
+        date_value,
+        2
+    )
 
-    # -------------------------
-    # BULLISH
-    # -------------------------
+    candle_06 = find_candle(
+        candles,
+        date_value,
+        6
+    )
 
-    if bullish_setup(reference, confirmation):
+    if candle_02 and candle_06:
 
-        return {
-            "direction": "BULLISH",
-            "reference": reference,
-            "confirmation": confirmation,
-            "entry_hour": entry_hour
+        # Bullish
+        if bullish_setup(candle_02, candle_06):
+
+            signals.append({
+                "date": date_value,
+                "entry_time": "10:00",
+                "direction": "BUY",
+                "reference": "02:00",
+                "confirmation": "06:00",
+                "reference_candle": candle_02,
+                "confirmation_candle": candle_06
+            })
+
+        # Bearish
+        elif bearish_setup(candle_02, candle_06):
+
+            signals.append({
+                "date": date_value,
+                "entry_time": "10:00",
+                "direction": "SELL",
+                "reference": "02:00",
+                "confirmation": "06:00",
+                "reference_candle": candle_02,
+                "confirmation_candle": candle_06
+            })
+
+    # ========================================================
+    # SETUP 2
+    # 06:00 -> 10:00 -> ENTRY 14:00
+    # ========================================================
+
+    candle_10 = find_candle(
+        candles,
+        date_value,
+        10
+    )
+
+    if candle_06 and candle_10:
+
+        # Bullish
+        if bullish_setup(candle_06, candle_10):
+
+            signals.append({
+                "date": date_value,
+                "entry_time": "14:00",
+                "direction": "BUY",
+                "reference": "06:00",
+                "confirmation": "10:00",
+                "reference_candle": candle_06,
+                "confirmation_candle": candle_10
+            })
+
+        # Bearish
+        elif bearish_setup(candle_06, candle_10):
+
+            signals.append({
+                "date": date_value,
+                "entry_time": "14:00",
+                "direction": "SELL",
+                "reference": "06:00",
+                "confirmation": "10:00",
+                "reference_candle": candle_06,
+                "confirmation_candle": candle_10
+            })
+
+    return signals
+
+
+# ------------------------------------------------------------
+# SCAN MARKET
+# ------------------------------------------------------------
+
+def scan_market(ws, symbol):
+
+    candles, error = get_candles(ws, symbol)
+
+    if error:
+
+        return [], error
+
+    converted = []
+
+    for candle in candles:
+
+        try:
+            converted.append(
+                convert_candle(candle)
+            )
+        except Exception:
+            continue
+
+    if len(converted) < 5:
+
+        return [], {
+            "message": "Not enough candles"
         }
 
-    # -------------------------
-    # BEARISH
-    # -------------------------
+    # Remove incomplete current candle.
+    # A 4H candle is considered complete only when
+    # another candle has already started.
+    now = datetime.now(WAT)
 
-    if bearish_setup(reference, confirmation):
+    completed = []
 
-        return {
-            "direction": "BEARISH",
-            "reference": reference,
-            "confirmation": confirmation,
-            "entry_hour": entry_hour
+    for candle in converted:
+
+        candle_end = candle["time"] + timedelta(hours=4)
+
+        if candle_end <= now:
+            completed.append(candle)
+
+    if len(completed) < 3:
+
+        return [], {
+            "message": "Not enough completed candles"
         }
 
-    return None
-
-
-def print_signal(market, signal, reference_hour, confirmation_hour):
-
-    reference = signal["reference"]
-    confirmation = signal["confirmation"]
-
-    direction = signal["direction"]
-
-    print("\n")
-    print("🚨" + "=" * 55)
-    print("🚨 SIXSGAMES SIGNAL FOUND")
-    print("🚨" + "=" * 55)
-
-    print(f"📊 Market: {market['name']}")
-    print(f"🔑 Symbol: {market['symbol']}")
-    print(f"📈 Direction: {direction}")
-
-    print(
-        f"🕐 Reference candle: "
-        f"{reference_hour:02d}:00 WAT"
+    # Get unique dates
+    dates = sorted(
+        set(
+            candle["time"].date()
+            for candle in completed
+        )
     )
 
-    print(
-        f"🕐 Confirmation candle: "
-        f"{confirmation_hour:02d}:00 WAT"
-    )
+    all_signals = []
 
-    print(
-        f"🎯 Entry window: "
-        f"{signal['entry_hour']:02d}:00 WAT"
-    )
+    for date_value in dates:
 
-    print("\nREFERENCE CANDLE")
-
-    print(f"Open : {reference['open']}")
-    print(f"High : {reference['high']}")
-    print(f"Low  : {reference['low']}")
-    print(f"Close: {reference['close']}")
-
-    print("\nCONFIRMATION CANDLE")
-
-    print(f"Open : {confirmation['open']}")
-    print(f"High : {confirmation['high']}")
-    print(f"Low  : {confirmation['low']}")
-    print(f"Close: {confirmation['close']}")
-
-    if direction == "BULLISH":
-
-        print("\n✅ LOW SWEPT")
-        print("✅ CLOSE ABOVE REFERENCE OPEN")
-
-    else:
-
-        print("\n✅ HIGH SWEPT")
-        print("✅ CLOSE BELOW REFERENCE OPEN")
-
-    print(
-        f"\n🎯 LOOK FOR YOUR ENTRY AT "
-        f"{signal['entry_hour']:02d}:00 WAT"
-    )
-
-    print("🚨" + "=" * 55)
-
-
-def scan_market(ws, market):
-
-    symbol = market["symbol"]
-
-    try:
-
-        candles = get_4h_candles(ws, symbol)
-
-        if not candles:
-            return []
-
-        signals = []
-
-        # ------------------------------------------------
-        # SETUP 1
-        #
-        # 02:00 -> 06:00 -> 10:00
-        # ------------------------------------------------
-
-        signal_1 = analyze_setup(
-            candles,
-            reference_hour=2,
-            confirmation_hour=6,
-            entry_hour=10
+        daily_signals = scan_day(
+            completed,
+            date_value
         )
 
-        if signal_1:
-            signals.append(
-                (
-                    signal_1,
-                    2,
-                    6
-                )
-            )
+        for signal in daily_signals:
 
-        # ------------------------------------------------
-        # SETUP 2
-        #
-        # 06:00 -> 10:00 -> 14:00
-        # ------------------------------------------------
+            signal["symbol"] = symbol
 
-        signal_2 = analyze_setup(
-            candles,
-            reference_hour=6,
-            confirmation_hour=10,
-            entry_hour=14
-        )
+            all_signals.append(signal)
 
-        if signal_2:
-            signals.append(
-                (
-                    signal_2,
-                    6,
-                    10
-                )
-            )
+    return all_signals, None
 
-        return signals
 
-    except Exception as e:
+# ------------------------------------------------------------
+# PRINT SIGNAL
+# ------------------------------------------------------------
 
-        print(
-            f"⚠️ {market['name']} "
-            f"({symbol}) error: {e}"
-        )
+def print_signal(signal):
 
-        return []
+    ref = signal["reference_candle"]
+    conf = signal["confirmation_candle"]
 
+    print("")
+    print("🚨" * 25)
+    print("🔥 VALID SETUP FOUND!")
+    print("🚨" * 25)
+
+    print(f"📊 Market: {signal['symbol']}")
+    print(f"📅 Date: {signal['date']}")
+    print(f"🎯 Direction: {signal['direction']}")
+    print(f"⏰ ENTRY: {signal['entry_time']} WAT")
+
+    print("")
+    print(
+        f"Reference candle {signal['reference']}: "
+        f"O={ref['open']} "
+        f"H={ref['high']} "
+        f"L={ref['low']} "
+        f"C={ref['close']}"
+    )
+
+    print(
+        f"Confirmation candle {signal['confirmation']}: "
+        f"O={conf['open']} "
+        f"H={conf['high']} "
+        f"L={conf['low']} "
+        f"C={conf['close']}"
+    )
+
+    print("")
+    print("✅ Conditions satisfied.")
+    print("👀 Look for your entry at the indicated entry time.")
+    print("🚨" * 25)
+    print("")
+
+
+# ------------------------------------------------------------
+# MAIN
+# ------------------------------------------------------------
 
 def main():
 
-    print("=" * 65)
+    print("")
+    print("=" * 60)
     print("🤖 SIXSGAMES TIME-BASED 4H STRATEGY SCANNER")
-    print("=" * 65)
+    print("=" * 60)
 
     ws = None
 
     try:
 
-        print("\n🔌 Connecting to Deriv...")
+        ws = connect()
 
-        ws = websocket.create_connection(
-            URL,
-            timeout=20
-        )
-
-        print("✅ Connected successfully!")
-
-        # ------------------------------------------------
-        # DISCOVER MARKETS
-        # ------------------------------------------------
-
-        all_markets = get_active_markets(ws)
-
-        markets = choose_markets(all_markets)
-
-        print(
-            f"\n📊 Requested markets available: "
-            f"{len(markets)}"
-        )
+        markets = discover_markets(ws)
 
         if not markets:
 
-            print(
-                "\n❌ No requested markets were found."
-            )
-
-            print(
-                "Check the active_symbols response "
-                "and market-name mapping."
-            )
-
+            print("")
+            print("❌ No requested markets are available.")
             return
 
-        # ------------------------------------------------
-        # SHOW MARKETS
-        # ------------------------------------------------
+        print("")
+        print("=" * 60)
+        print("🔎 STARTING STRATEGY SCAN")
+        print("=" * 60)
 
-        print("\n📋 MARKETS TO SCAN")
-        print("-" * 65)
-
-        for i, market in enumerate(markets, 1):
-
-            print(
-                f"{i:02d}. "
-                f"{market['name']} "
-                f"→ {market['symbol']}"
-            )
-
-        print("-" * 65)
-
-        # ------------------------------------------------
-        # SCAN
-        # ------------------------------------------------
-
-        print("\n🔍 STARTING STRATEGY SCAN...")
-        print(
-            "Timezone: WAT (UTC+1)"
-        )
-
-        print(
-            "Setup 1: 02:00 → 06:00 → 10:00"
-        )
-
-        print(
-            "Setup 2: 06:00 → 10:00 → 14:00"
-        )
-
+        total_markets = 0
+        successful_markets = 0
         total_signals = 0
 
-        for market in markets:
+        for symbol in markets:
 
-            print(
-                f"\n🔎 Scanning "
-                f"{market['name']} "
-                f"({market['symbol']})..."
+            total_markets += 1
+
+            display_name = markets[symbol].get(
+                "display_name",
+                symbol
             )
 
-            signals = scan_market(
+            print("")
+            print(f"🔍 Scanning {display_name} ({symbol})...")
+
+            signals, error = scan_market(
                 ws,
-                market
+                symbol
             )
+
+            if error:
+
+                print(
+                    f"⚠️ Could not scan {symbol}: "
+                    f"{error}"
+                )
+
+                continue
+
+            successful_markets += 1
 
             if signals:
 
-                for signal, ref_hour, conf_hour in signals:
+                print(
+                    f"🚨 {len(signals)} valid setup(s) found!"
+                )
 
-                    print_signal(
-                        market,
-                        signal,
-                        ref_hour,
-                        conf_hour
-                    )
+                for signal in signals:
 
                     total_signals += 1
 
+                    print_signal(signal)
+
             else:
 
-                print("   No valid setup found.")
+                print("⚪ No valid setup found.")
 
-        # ------------------------------------------------
-        # SUMMARY
-        # ------------------------------------------------
-
-        print("\n")
-        print("=" * 65)
-        print("📊 SCAN COMPLETE")
-        print("=" * 65)
+        print("")
+        print("=" * 60)
+        print("📊 SCAN SUMMARY")
+        print("=" * 60)
 
         print(
-            f"Markets scanned: {len(markets)}"
+            f"Markets requested: {len(REQUESTED_MARKETS)}"
         )
 
         print(
-            f"Valid signals found: {total_signals}"
+            f"Markets available: {len(markets)}"
         )
 
-        if total_signals == 0:
+        print(
+            f"Markets scanned successfully: "
+            f"{successful_markets}"
+        )
 
-            print(
-                "\nℹ️ No valid setups were found "
-                "in the requested historical candles."
-            )
+        print(
+            f"🔥 Total historical valid setups: "
+            f"{total_signals}"
+        )
 
-        else:
-
-            print(
-                "\n🚨 Review the signals above "
-                "for your manual entries."
-            )
-
-        print("\n🤖 Scanner finished successfully.")
+        print("")
+        print("🤖 Scanner finished successfully.")
 
     except Exception as e:
 
-        print("\n❌ SCANNER ERROR")
+        print("")
+        print("=" * 60)
+        print("❌ SCANNER ERROR")
+        print("=" * 60)
+
         print(str(e))
 
     finally:
@@ -639,7 +658,7 @@ def main():
 
             try:
                 ws.close()
-            except:
+            except Exception:
                 pass
 
 
