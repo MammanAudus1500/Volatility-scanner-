@@ -1,28 +1,46 @@
 import json
 import os
+import sys
+import time
+import urllib.parse
+import urllib.request
 import websocket
+
 from datetime import datetime, timezone, timedelta
+
 
 # ============================================================
 # SIXSGAMES
-# ONE-RUN 1H -> CUSTOM 4H SCANNER
+# ONE-RUN 1H -> CUSTOM 4H STRATEGY SCANNER
+# ============================================================
 #
-# IMPORTANT:
-# Deriv's native 4H candles may start at 01:00, 05:00, 09:00...
-# Our strategy requires:
+# Deriv native 4H candles can be aligned differently.
+#
+# Therefore we use 1H candles and construct our own candles:
 #
 # 02:00 -> 06:00
 # 06:00 -> 10:00
 # 10:00 -> 14:00
 # 14:00 -> 18:00
+# 18:00 -> 22:00
+# 22:00 -> 02:00
 #
-# Therefore we download 1H candles and construct our own
-# 4-hour candles aligned to Africa/Lagos time.
+# Timezone: Africa/Lagos (WAT, UTC+1)
+#
+# The scanner runs ONE TIME only.
 # ============================================================
+
 
 DERIV_URL = "wss://api.derivws.com/trading/v1/options/ws/public"
 
 WAT = timezone(timedelta(hours=1))
+
+HISTORY_COUNT = 1000
+
+
+# ============================================================
+# 42 MARKETS
+# ============================================================
 
 MARKETS = [
     "1HZ10V",
@@ -74,33 +92,26 @@ MARKETS = [
     "cryBTCUSD"
 ]
 
-# ------------------------------------------------------------
-# How many 1H candles to request.
-#
-# 2000 hours gives us plenty of historical data for testing.
-# ------------------------------------------------------------
-
-HISTORY_COUNT = 2000
-
 
 # ============================================================
-# TELEGRAM
+# TELEGRAM SETTINGS
 # ============================================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 
-def telegram_send(message):
+# ============================================================
+# TELEGRAM
+# ============================================================
+
+def send_telegram(message):
 
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("⚠️ Telegram secrets not available.")
+        print("⚠️ Telegram secrets not found.")
         return False
 
     try:
-
-        import urllib.request
-        import urllib.parse
 
         url = (
             "https://api.telegram.org/bot"
@@ -128,35 +139,38 @@ def telegram_send(message):
                 response.read().decode("utf-8")
             )
 
-            if result.get("ok"):
-                print("📨 Telegram signal sent.")
-                return True
+        if result.get("ok"):
 
-            print("❌ Telegram rejected message:")
-            print(result)
+            print("📨 Telegram message sent.")
+            return True
 
-    except Exception as e:
+        print("❌ Telegram returned an error:")
+        print(result)
+
+    except Exception as error:
 
         print("❌ Telegram error:")
-        print(str(e))
+        print(error)
 
     return False
 
 
 # ============================================================
-# CONNECT TO DERIV
+# DERIV CONNECTION
 # ============================================================
 
-def connect():
+def connect_deriv():
 
     print("🔌 Connecting to Deriv...")
+    sys.stdout.flush()
 
     ws = websocket.create_connection(
         DERIV_URL,
         timeout=20
     )
 
-    print("✅ Connected successfully!")
+    print("✅ Connected to Deriv.")
+    sys.stdout.flush()
 
     return ws
 
@@ -165,9 +179,11 @@ def connect():
 # DERIV REQUEST
 # ============================================================
 
-def request(ws, payload):
+def deriv_request(ws, payload):
 
-    ws.send(json.dumps(payload))
+    ws.send(
+        json.dumps(payload)
+    )
 
     while True:
 
@@ -185,10 +201,10 @@ def request(ws, payload):
 
 
 # ============================================================
-# GET 1H CANDLES
+# GET 1-HOUR CANDLES
 # ============================================================
 
-def get_1h_candles(ws, symbol):
+def get_hourly_candles(ws, symbol):
 
     payload = {
         "ticks_history": symbol,
@@ -196,11 +212,10 @@ def get_1h_candles(ws, symbol):
         "count": HISTORY_COUNT,
         "end": "latest",
         "granularity": 3600,
-        "style": "candles",
-        "req_id": 100
+        "style": "candles"
     }
 
-    response = request(
+    response = deriv_request(
         ws,
         payload
     )
@@ -217,155 +232,151 @@ def get_1h_candles(ws, symbol):
     if not candles:
 
         return None, {
-            "message": "No 1H candles returned"
+            "message": "No hourly candles returned"
         }
 
     return candles, None
 
 
 # ============================================================
-# CONVERT 1H CANDLE
+# CONVERT DERIV CANDLE
 # ============================================================
 
-def convert_1h_candle(candle):
+def convert_candle(raw):
 
-    timestamp = int(
-        candle["epoch"]
+    epoch = int(
+        raw["epoch"]
     )
 
     dt = datetime.fromtimestamp(
-        timestamp,
+        epoch,
         timezone.utc
     ).astimezone(WAT)
 
     return {
         "time": dt,
-        "open": float(candle["open"]),
-        "high": float(candle["high"]),
-        "low": float(candle["low"]),
-        "close": float(candle["close"])
+        "open": float(raw["open"]),
+        "high": float(raw["high"]),
+        "low": float(raw["low"]),
+        "close": float(raw["close"])
     }
 
 
 # ============================================================
-# BUILD CUSTOM 4H CANDLES
+# CUSTOM 4H START TIME
+# ============================================================
 #
-# We deliberately DO NOT use Deriv's native 4H candles.
+# We want:
 #
-# A custom candle beginning at 02:00 contains:
+# 02
+# 06
+# 10
+# 14
+# 18
+# 22
 #
-# 02:00 hour
-# 03:00 hour
-# 04:00 hour
-# 05:00 hour
-#
-# It closes at 06:00.
-#
-# Then:
-#
-# 06:00 -> 10:00
-# 10:00 -> 14:00
-# 14:00 -> 18:00
+# Every four hours.
 # ============================================================
 
-def build_custom_4h_candles(hourly_candles):
+def get_custom_start(dt):
+
+    hour = dt.hour
+
+    if hour in [2, 3, 4, 5]:
+        start_hour = 2
+
+    elif hour in [6, 7, 8, 9]:
+        start_hour = 6
+
+    elif hour in [10, 11, 12, 13]:
+        start_hour = 10
+
+    elif hour in [14, 15, 16, 17]:
+        start_hour = 14
+
+    elif hour in [18, 19, 20, 21]:
+        start_hour = 18
+
+    else:
+        # 22, 23, 00, 01
+        start_hour = 22
+
+    date_value = dt.date()
+
+    # 00:00 and 01:00 belong to yesterday's
+    # 22:00 -> 02:00 candle.
+    if hour in [0, 1]:
+
+        date_value = (
+            dt - timedelta(days=1)
+        ).date()
+
+    return (
+        date_value,
+        start_hour
+    )
+
+
+# ============================================================
+# BUILD CUSTOM 4H CANDLES
+# ============================================================
+
+def build_custom_4h(hourly):
 
     groups = {}
 
-    for candle in hourly_candles:
+    for candle in hourly:
 
-        dt = candle["time"]
-
-        # ----------------------------------------------------
-        # Custom 4H windows start at:
-        # 02, 06, 10, 14, 18, 22
-        # ----------------------------------------------------
-
-        hour = dt.hour
-
-        if hour in [2, 6, 10, 14, 18, 22]:
-
-            start_hour = hour
-
-        elif hour in [3, 7, 11, 15, 19, 23]:
-
-            start_hour = hour - 1
-
-        elif hour in [0, 4, 8, 12, 16, 20]:
-
-            start_hour = hour - 2
-
-            if start_hour < 0:
-                start_hour += 24
-
-        else:
-
-            continue
-
-        # ----------------------------------------------------
-        # Determine the actual start date.
-        #
-        # For 00:00 and 01:00, they belong to the previous
-        # day's 22:00 -> 02:00 candle.
-        # ----------------------------------------------------
-
-        date_value = dt.date()
-
-        if hour in [0, 1]:
-            start_hour = 22
-            date_value = (
-                dt - timedelta(days=1)
-            ).date()
+        start_date, start_hour = get_custom_start(
+            candle["time"]
+        )
 
         key = (
-            date_value,
+            start_date,
             start_hour
         )
 
         if key not in groups:
+
             groups[key] = []
 
-        groups[key].append(candle)
+        groups[key].append(
+            candle
+        )
 
     custom = []
 
-    for key, candles in groups.items():
+    for key, group in groups.items():
 
-        date_value, start_hour = key
-
-        # ----------------------------------------------------
-        # We need exactly four hourly candles.
-        # ----------------------------------------------------
-
-        if len(candles) != 4:
-            continue
-
-        candles.sort(
+        group.sort(
             key=lambda x: x["time"]
         )
 
-        first = candles[0]
-        last = candles[-1]
+        # A complete 4H candle must contain exactly
+        # four consecutive 1H candles.
+        if len(group) != 4:
+            continue
 
-        # Verify the four candles are consecutive.
-        valid = True
+        consecutive = True
 
         for i in range(1, 4):
 
             difference = (
-                candles[i]["time"]
-                - candles[i - 1]["time"]
+                group[i]["time"]
+                - group[i - 1]["time"]
             )
 
             if difference != timedelta(hours=1):
 
-                valid = False
+                consecutive = False
                 break
 
-        if not valid:
+        if not consecutive:
             continue
 
-        start_dt = datetime(
+        date_value, start_hour = key
+
+        start_time = datetime(
             date_value.year,
             date_value.month,
             date_value.day,
@@ -375,23 +386,28 @@ def build_custom_4h_candles(hourly_candles):
             tzinfo=WAT
         )
 
-        end_dt = start_dt + timedelta(
-            hours=4
+        end_time = (
+            start_time
+            + timedelta(hours=4)
         )
 
         custom_candle = {
-            "start": start_dt,
-            "end": end_dt,
-            "open": first["open"],
+            "start": start_time,
+            "end": end_time,
+
+            "open": group[0]["open"],
+
             "high": max(
-                c["high"]
-                for c in candles
+                candle["high"]
+                for candle in group
             ),
+
             "low": min(
-                c["low"]
-                for c in candles
+                candle["low"]
+                for candle in group
             ),
-            "close": last["close"]
+
+            "close": group[-1]["close"]
         }
 
         custom.append(
@@ -406,28 +422,31 @@ def build_custom_4h_candles(hourly_candles):
 
 
 # ============================================================
-# REMOVE CURRENTLY FORMING CUSTOM CANDLE
+# KEEP ONLY COMPLETED CUSTOM CANDLES
 # ============================================================
 
-def completed_custom_candles(candles):
+def get_completed_custom_candles(custom):
 
     now = datetime.now(WAT)
 
-    result = []
+    completed = []
 
-    for candle in candles:
+    for candle in custom:
 
         if candle["end"] <= now:
-            result.append(candle)
 
-    return result
+            completed.append(
+                candle
+            )
+
+    return completed
 
 
 # ============================================================
-# FIND CUSTOM CANDLE
+# FIND CANDLE
 # ============================================================
 
-def find_custom_candle(
+def find_candle(
     candles,
     date_value,
     start_hour
@@ -441,99 +460,87 @@ def find_custom_candle(
             and candle["start"].hour
             == start_hour
         ):
+
             return candle
 
     return None
 
 
 # ============================================================
-# BULLISH RULE
+# BUY SETUP
+# ============================================================
 #
-# IMPORTANT:
-# We DO NOT care whether the reference candle itself is
-# bullish or bearish.
+# Reference direction DOES NOT MATTER.
 #
-# BUY requires:
+# Confirmation must:
 #
-# confirmation LOW < reference LOW
+# 1. Sweep the reference LOW
+# 2. Close STRICTLY ABOVE reference OPEN
 #
-# AND
-#
-# confirmation CLOSE > reference OPEN
-#
-# Strictly greater.
-#
-# Equal = INVALID.
+# Equal to reference open = INVALID.
 # ============================================================
 
-def bullish_setup(
+def is_buy_setup(
     reference,
     confirmation
 ):
 
-    swept = (
+    sweep = (
         confirmation["low"]
         < reference["low"]
     )
 
-    closed_above = (
+    close_condition = (
         confirmation["close"]
         > reference["open"]
     )
 
-    return swept and closed_above
+    return (
+        sweep
+        and close_condition
+    )
 
 
 # ============================================================
-# BEARISH RULE
+# SELL SETUP
+# ============================================================
 #
-# Reference candle direction is irrelevant.
+# Reference direction DOES NOT MATTER.
 #
-# SELL requires:
+# Confirmation must:
 #
-# confirmation HIGH > reference HIGH
+# 1. Sweep the reference HIGH
+# 2. Close STRICTLY BELOW reference OPEN
 #
-# AND
-#
-# confirmation CLOSE < reference OPEN
-#
-# Strictly lower.
-#
-# Equal = INVALID.
+# Equal to reference open = INVALID.
 # ============================================================
 
-def bearish_setup(
+def is_sell_setup(
     reference,
     confirmation
 ):
 
-    swept = (
+    sweep = (
         confirmation["high"]
         > reference["high"]
     )
 
-    closed_below = (
+    close_condition = (
         confirmation["close"]
         < reference["open"]
     )
 
-    return swept and closed_below
+    return (
+        sweep
+        and close_condition
+    )
 
 
 # ============================================================
-# CHECK ONE MARKET
-#
-# We scan historical completed custom candles.
-#
-# Setup A:
-# 02 -> 06 -> entry 10
-#
-# Setup B:
-# 06 -> 10 -> entry 14
-#
+# SCAN STRATEGY
 # ============================================================
 
-def scan_market(
+def scan_strategy(
     symbol,
     candles
 ):
@@ -547,20 +554,21 @@ def scan_market(
         )
     )
 
-    # --------------------------------------------------------
-    # SETUP A
-    # 02:00 -> 06:00 -> ENTRY 10:00
-    # --------------------------------------------------------
-
     for date_value in dates:
 
-        candle_02 = find_custom_candle(
+        # ====================================================
+        # SETUP 1
+        #
+        # 02 -> 06 -> ENTRY 10
+        # ====================================================
+
+        candle_02 = find_candle(
             candles,
             date_value,
             2
         )
 
-        candle_06 = find_custom_candle(
+        candle_06 = find_candle(
             candles,
             date_value,
             6
@@ -568,7 +576,7 @@ def scan_market(
 
         if candle_02 and candle_06:
 
-            if bullish_setup(
+            if is_buy_setup(
                 candle_02,
                 candle_06
             ):
@@ -580,11 +588,11 @@ def scan_market(
                     "confirmation": "06:00",
                     "entry": "10:00",
                     "direction": "BUY",
-                    "ref": candle_02,
-                    "conf": candle_06
+                    "reference_candle": candle_02,
+                    "confirmation_candle": candle_06
                 })
 
-            if bearish_setup(
+            if is_sell_setup(
                 candle_02,
                 candle_06
             ):
@@ -596,16 +604,17 @@ def scan_market(
                     "confirmation": "06:00",
                     "entry": "10:00",
                     "direction": "SELL",
-                    "ref": candle_02,
-                    "conf": candle_06
+                    "reference_candle": candle_02,
+                    "confirmation_candle": candle_06
                 })
 
-        # ----------------------------------------------------
-        # SETUP B
-        # 06:00 -> 10:00 -> ENTRY 14:00
-        # ----------------------------------------------------
+        # ====================================================
+        # SETUP 2
+        #
+        # 06 -> 10 -> ENTRY 14
+        # ====================================================
 
-        candle_10 = find_custom_candle(
+        candle_10 = find_candle(
             candles,
             date_value,
             10
@@ -613,7 +622,7 @@ def scan_market(
 
         if candle_06 and candle_10:
 
-            if bullish_setup(
+            if is_buy_setup(
                 candle_06,
                 candle_10
             ):
@@ -625,11 +634,11 @@ def scan_market(
                     "confirmation": "10:00",
                     "entry": "14:00",
                     "direction": "BUY",
-                    "ref": candle_06,
-                    "conf": candle_10
+                    "reference_candle": candle_06,
+                    "confirmation_candle": candle_10
                 })
 
-            if bearish_setup(
+            if is_sell_setup(
                 candle_06,
                 candle_10
             ):
@@ -641,8 +650,8 @@ def scan_market(
                     "confirmation": "10:00",
                     "entry": "14:00",
                     "direction": "SELL",
-                    "ref": candle_06,
-                    "conf": candle_10
+                    "reference_candle": candle_06,
+                    "confirmation_candle": candle_10
                 })
 
     return signals
@@ -652,10 +661,13 @@ def scan_market(
 # PRINT CANDLE
 # ============================================================
 
-def print_candle(label, candle):
+def print_candle(
+    label,
+    candle
+):
 
     print(
-        f"   {label} "
+        f"{label} "
         f"O={candle['open']} "
         f"H={candle['high']} "
         f"L={candle['low']} "
@@ -670,9 +682,9 @@ def print_candle(label, candle):
 def print_signal(signal):
 
     print("")
-    print("=" * 70)
+    print("🚨" * 20)
     print("🚨 VALID SIXSGAMES SETUP")
-    print("=" * 70)
+    print("🚨" * 20)
 
     print(
         f"📊 Market: {signal['symbol']}"
@@ -687,63 +699,65 @@ def print_signal(signal):
     )
 
     print(
+        f"🕐 Reference: "
+        f"{signal['reference']} WAT"
+    )
+
+    print(
+        f"🕐 Confirmation: "
+        f"{signal['confirmation']} WAT"
+    )
+
+    print(
         f"🎯 LOOK FOR ENTRY: "
         f"{signal['entry']} WAT"
     )
 
-    print(
-        f"Reference candle: "
-        f"{signal['reference']}"
+    print("")
+
+    print_candle(
+        "Reference    :",
+        signal["reference_candle"]
     )
 
-    print(
-        f"Confirmation candle: "
-        f"{signal['confirmation']}"
+    print_candle(
+        "Confirmation :",
+        signal["confirmation_candle"]
     )
 
     print("")
 
-    print_candle(
-        "Reference:",
-        signal["ref"]
-    )
-
-    print_candle(
-        "Confirm  :",
-        signal["conf"]
-    )
-
-    print("")
     print("✅ Sweep condition passed.")
     print("✅ Close condition passed.")
     print("👀 LOOK FOR YOUR ENTRY.")
-    print("=" * 70)
+
+    print("")
 
 
 # ============================================================
-# TELEGRAM FORMAT
+# TELEGRAM SIGNAL
 # ============================================================
 
-def telegram_signal_message(signal):
+def make_telegram_message(signal):
 
-    direction = signal["direction"]
+    if signal["direction"] == "BUY":
 
-    emoji = (
-        "🟢 BUY"
-        if direction == "BUY"
-        else "🔴 SELL"
-    )
+        direction = "🟢 BUY"
+
+    else:
+
+        direction = "🔴 SELL"
 
     return (
         "🚨 SIXSGAMES SIGNAL 🚨\n\n"
         f"📊 Market: {signal['symbol']}\n"
         f"📅 Date: {signal['date']}\n"
-        f"🎯 Direction: {emoji}\n\n"
+        f"🎯 Direction: {direction}\n\n"
         f"🕐 Reference: {signal['reference']} WAT\n"
         f"🕐 Confirmation: {signal['confirmation']} WAT\n"
-        f"🎯 LOOK FOR ENTRY: {signal['entry']} WAT\n\n"
+        f"🎯 ENTRY: {signal['entry']} WAT\n\n"
         "✅ Sweep confirmed\n"
-        "✅ Close beyond reference OPEN confirmed\n\n"
+        "✅ Close condition confirmed\n\n"
         "👀 LOOK FOR YOUR ENTRY."
     )
 
@@ -756,7 +770,7 @@ def main():
 
     print("")
     print("=" * 70)
-    print("🤖 SIXSGAMES ONE-RUN CUSTOM 4H SCANNER")
+    print("🤖 SIXSGAMES CUSTOM 4H CANDLE SCANNER")
     print("=" * 70)
 
     print(
@@ -765,11 +779,11 @@ def main():
     )
 
     print(
-        "⏱️ Source timeframe: 1H"
+        "📥 Source candles: 1H"
     )
 
     print(
-        "⏱️ Custom strategy timeframe: 4H"
+        "🧱 Constructed candles: CUSTOM 4H"
     )
 
     print(
@@ -777,8 +791,8 @@ def main():
     )
 
     print(
-        "🎯 Custom candles: "
-        "02, 06, 10, 14, 18, 22"
+        "🎯 Strategy times: "
+        "02 / 06 / 10 / 14 / 18 / 22"
     )
 
     print(
@@ -786,6 +800,8 @@ def main():
     )
 
     print("=" * 70)
+
+    sys.stdout.flush()
 
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
 
@@ -796,38 +812,44 @@ def main():
     else:
 
         print(
-            "⚠️ Telegram secrets NOT detected."
+            "⚠️ Telegram secrets are missing."
         )
+
+    sys.stdout.flush()
 
     ws = None
 
     total_signals = 0
     telegram_sent = 0
-    markets_completed = 0
+    successful_markets = 0
 
     try:
 
-        ws = connect()
+        ws = connect_deriv()
 
         print("")
         print("=" * 70)
         print("🔎 SCANNING ALL 42 MARKETS")
         print("=" * 70)
 
-        for index, symbol in enumerate(
+        sys.stdout.flush()
+
+        for number, symbol in enumerate(
             MARKETS,
             start=1
         ):
 
             print("")
             print(
-                f"[{index}/{len(MARKETS)}] "
-                f"🔍 {symbol}"
+                f"[{number}/{len(MARKETS)}] "
+                f"🔍 CHECKING {symbol}"
             )
+
+            sys.stdout.flush()
 
             try:
 
-                raw_candles, error = get_1h_candles(
+                raw, error = get_hourly_candles(
                     ws,
                     symbol
                 )
@@ -835,32 +857,40 @@ def main():
                 if error:
 
                     print(
-                        "   ❌ Candle error:",
+                        "   ❌ Deriv error:",
                         error
                     )
+
+                    sys.stdout.flush()
 
                     continue
 
                 hourly = []
 
-                for raw in raw_candles:
+                for item in raw:
 
                     try:
 
                         hourly.append(
-                            convert_1h_candle(raw)
+                            convert_candle(item)
                         )
 
                     except Exception:
-                        continue
+                        pass
 
                 print(
-                    f"   📥 1H candles: "
+                    f"   📥 1H candles received: "
                     f"{len(hourly)}"
                 )
 
-                custom = build_custom_4h_candles(
+                custom = build_custom_4h(
                     hourly
+                )
+
+                completed = (
+                    get_completed_custom_candles(
+                        custom
+                    )
                 )
 
                 print(
@@ -868,27 +898,46 @@ def main():
                     f"{len(custom)}"
                 )
 
-                completed = completed_custom_candles(
-                    custom
-                )
-
                 print(
-                    f"   ✅ Completed custom candles: "
+                    f"   ✅ Completed custom 4H: "
                     f"{len(completed)}"
                 )
 
-                signals = scan_market(
+                # ------------------------------------------------
+                # Show the most recent custom candle alignment.
+                # This is VERY IMPORTANT for this test.
+                # ------------------------------------------------
+
+                print(
+                    "   🕯️ Latest custom candles:"
+                )
+
+                for candle in completed[-6:]:
+
+                    print(
+                        "      "
+                        + candle["start"].strftime(
+                            "%Y-%m-%d %H:%M"
+                        )
+                        + " -> "
+                        + candle["end"].strftime(
+                            "%H:%M"
+                        )
+                    )
+
+                signals = scan_strategy(
                     symbol,
                     completed
                 )
 
-                markets_completed += 1
+                successful_markets += 1
 
                 if signals:
 
+                    print("")
                     print(
-                        f"   🚨 SETUPS FOUND: "
-                        f"{len(signals)}"
+                        f"   🚨 "
+                        f"{len(signals)} SETUP(S) FOUND"
                     )
 
                     for signal in signals:
@@ -899,10 +948,14 @@ def main():
                             signal
                         )
 
-                        if telegram_send(
-                            telegram_signal_message(
+                        message = (
+                            make_telegram_message(
                                 signal
                             )
+                        )
+
+                        if send_telegram(
+                            message
                         ):
 
                             telegram_sent += 1
@@ -913,11 +966,20 @@ def main():
                         "   ⚪ No valid setup found."
                     )
 
-            except Exception as e:
+                sys.stdout.flush()
+
+            except Exception as error:
 
                 print(
-                    f"   ❌ Market error: {e}"
+                    f"   ❌ Market processing error: "
+                    f"{error}"
                 )
+
+                sys.stdout.flush()
+
+        # ========================================================
+        # FINAL RESULT
+        # ========================================================
 
         print("")
         print("=" * 70)
@@ -925,54 +987,71 @@ def main():
         print("=" * 70)
 
         print(
-            f"Markets requested: "
+            f"📊 Markets requested: "
             f"{len(MARKETS)}"
         )
 
         print(
-            f"Markets completed: "
-            f"{markets_completed}"
+            f"✅ Markets successfully scanned: "
+            f"{successful_markets}"
         )
 
         print(
-            f"Total valid setups: "
+            f"🚨 Total valid setups: "
             f"{total_signals}"
         )
 
         print(
-            f"Telegram messages sent: "
+            f"📨 Telegram signals sent: "
             f"{telegram_sent}"
         )
 
         print("")
         print(
-            "🛑 ONE-RUN SCAN FINISHED."
+            "🛑 ONE-RUN SCAN COMPLETE."
         )
 
         print(
-            "🛑 The scanner will now stop."
+            "🛑 Scanner is stopping now."
         )
 
         print("=" * 70)
 
-    except Exception as e:
+        sys.stdout.flush()
+
+    except Exception as error:
 
         print("")
         print("=" * 70)
         print("❌ SCANNER ERROR")
         print("=" * 70)
 
-        print(str(e))
+        print(error)
+
+        sys.stdout.flush()
 
     finally:
 
         if ws:
 
             try:
+
                 ws.close()
-                print("🔌 Deriv connection closed.")
+
+                print(
+                    "🔌 Deriv connection closed."
+                )
+
             except Exception:
                 pass
 
+        sys.stdout.flush()
 
-# ====================================================
+
+# ============================================================
+# START
+# ============================================================
+
+if __name__ == "__main__":
+
+    main()
