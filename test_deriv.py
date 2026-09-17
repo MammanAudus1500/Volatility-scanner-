@@ -1,4 +1,4 @@
-import json
+hiimport json
 import os
 import requests
 import websocket
@@ -98,8 +98,6 @@ MARKETS = [
     "frxGBPAUD",
     "frxUSDCHF",
     "frxXAUUSD",
-    ‎"frxNZDUSD",‎
-    "frxGBPCAD",
     ‎"frxAUDCAD",
     ‎"frxEURJPY",
     ‎"frxEURAUD",
