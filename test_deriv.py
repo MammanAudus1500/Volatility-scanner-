@@ -98,17 +98,7 @@ MARKETS = [
     "frxGBPAUD",
     "frxUSDCHF",
     "frxXAUUSD",
-    ‎"frxAUDCAD",
-    ‎"frxEURJPY",
-    ‎"frxEURAUD",
-    ‎"frxAUDJPY",
-    ‎"frxCADJPY",
-    ‎"frxEURNZD",
-    ‎"frxCHFJPY",
-    ‎"frxNZDCAD",
-    ‎"frxCADCHF",
-    ‎"frxNZDCHF",
-‎
+ 
 
     "cryBTCUSD"
 ]
